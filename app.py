@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MHZALY AI SECURITY ENGINEER - AUTONOMOUS AGENT SYSTEM v21.0
+MHZALY AI SECURITY ENGINEER - AUTONOMOUS AGENT SYSTEM v21.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 This is a complete, self-contained Autonomous AI Security Engineer platform.
 It integrates Deep Recon, Threat Intel Triage, NVD Correlation, and
@@ -23,9 +23,6 @@ from dataclasses import dataclass, asdict
 import socket
 import dns.resolver
 import re
-import urllib.parse
-import concurrent.futures
-import hmac
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,8 +52,6 @@ def assert_public_host(hostname: str) -> None:
                 raise ScopeViolation(f"Target '{hostname}' resolves to non-public IP ({ip_str}). Refusing to scan internal/reserved network space.")
     except socket.gaierror as e:
         raise ScopeViolation(f"Could not resolve host: {e}")
-    except ValueError:
-        continue # Should not happen with getaddrinfo
 
 def with_retry(fn: Callable, *args, retries: int = 3, backoff: float = 2.0, **kwargs):
     """Simple retry with exponential backoff for flaky/rate-limited HTTP calls."""
@@ -64,7 +59,7 @@ def with_retry(fn: Callable, *args, retries: int = 3, backoff: float = 2.0, **kw
     for attempt in range(retries + 1):
         try:
             return fn(*args, **kwargs)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.TooManyRequests) as e:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_exc = e
             if attempt < retries:
                 sleep_time = backoff ** attempt
@@ -74,7 +69,7 @@ def with_retry(fn: Callable, *args, retries: int = 3, backoff: float = 2.0, **kw
                 logger.error(f"Max retries reached. Last error: {e}")
         except Exception as e:
             logger.error(f"Non-retryable exception: {e}")
-            raise e # Don't retry on other exceptions
+            raise e
     raise last_exc
 
 # ==========================================
@@ -89,7 +84,7 @@ class VulnerabilityRecord:
     severity: str
     description: str
     remediation: str
-    match_confidence: str # cpe or keyword
+    match_confidence: str
 
 @dataclass
 class AgenticReasoning:
@@ -97,7 +92,7 @@ class AgenticReasoning:
     task: str
     evidence: str
     interpretation: str
-    confidence: str # Low, Medium, High
+    confidence: str
 
 # ==========================================
 # 2. AI CONNECTORS (APIs)
@@ -110,7 +105,6 @@ class AIConnectors:
         self.abuse_key = st.secrets.get("ABUSEIPDB_API_KEY", "")
         self.nvd_key = st.secrets.get("NVD_API_KEY", "")
         self.groq_key = st.secrets.get("GROQ_API_KEY", "")
-        self.headers_ua = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MHZALY-AI-Sec-Eng/21.0'}
 
     def query_virustotal(self, indicator: str) -> Dict[str, Any]:
         """Queries VirusTotal for domain/IP reputation."""
@@ -152,7 +146,6 @@ class AIConnectors:
                     desc = descs[0].get('value', 'No description') if descs else 'No description'
                     metrics = cve.get('metrics', {})
                     
-                    # Prefer CVSS v3.1, fallback to v3.0, then v2
                     cvss_data = {}
                     if 'cvssMetricV31' in metrics: cvss_data = metrics['cvssMetricV31'][0]['cvssData']
                     elif 'cvssMetricV30' in metrics: cvss_data = metrics['cvssMetricV30'][0]['cvssData']
@@ -162,16 +155,9 @@ class AIConnectors:
                     severity = cvss_data.get('baseSeverity', 'UNKNOWN')
                     
                     vulns.append(VulnerabilityRecord(
-                        cve_id=cve_id,
-                        title=cve_id,
-                        cvss_score=score,
-                        severity=severity,
-                        description=desc,
-                        remediation=f"Review official NVD advisory for {cve_id} and apply vendor patches.",
-                        match_confidence="keyword"
+                        cve_id=cve_id, title=cve_id, cvss_score=score, severity=severity,
+                        description=desc, remediation=f"Apply vendor patch for {cve_id}.", match_confidence="keyword"
                     ))
-            elif resp.status_code == 403:
-                 logger.warning("NVD API Key missing or rate limit exceeded (403).")
         except Exception as e: logger.error(f"NVD Error: {e}")
         return sorted(vulns, key=lambda x: x.cvss_score, reverse=True)
 
@@ -180,11 +166,10 @@ class AIConnectors:
         if not self.groq_key: return "ERROR: Groq API Key missing in secrets."
         try:
             payload = {
-                'model': 'llama-3.1-70b-versatile', # Using a powerful model for reasoning
+                'model': 'llama-3.1-70b-versatile',
                 'messages': [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}],
                 'temperature': temperature,
-                'max_tokens': max_tokens,
-                'top_p': 0.9,
+                'max_tokens': max_tokens
             }
             resp = with_retry(requests.post, "https://api.groq.com/openai/v1/chat/completions",
                              json=payload, headers={'Authorization': f'Bearer {self.groq_key}', 'Content-Type': 'application/json'}, timeout=60)
@@ -216,22 +201,17 @@ class AutonomousSecurityEngineer:
         if not self.target: return
 
         with st.status(f"🚀 Launching Autonomous AI Security Engineer for: {self.target}...", expanded=True) as status:
-            
-            # Agent 1: Autonomous Recon
             st.write("Agent 1: 🌐 Performing Authorized Reconnaissance...")
             self.perform_recon()
             
-            # Agent 2: Autonomous Threat Triage
             if 'error' not in self.memory:
                 st.write("Agent 2: 🛡️ Triaging Threat Intelligence...")
                 self.perform_threat_triage()
             
-            # Agent 3: Autonomous Vuln Research
             if 'error' not in self.memory:
                 st.write("Agent 3: 🔬 Researching NVD Vulnerabilities...")
                 self.perform_vulnerability_research()
                 
-            # Agent 4: Autonomous Remediation Strategist
             if 'error' not in self.memory:
                 st.write("Agent 4: 🧠 Synthesizing Remediation Strategy...")
                 self.perform_remediation_reasoning()
@@ -245,14 +225,11 @@ class AutonomousSecurityEngineer:
         """Agent 1 Implementation: Recon"""
         try:
             assert_public_host(self.target)
-            
-            # 1. DNS Resolution
             answers = dns.resolver.resolve(self.target, 'A')
             ips = [str(r) for r in answers]
             self.memory['ips'] = ips
             self._log_reasoning("DNS Resolution", f"{self.target} resolved to {', '.join(ips)}", "Target is publicly resolvable.", "High")
 
-            # 2. Subdomain Enumeration (crt.sh)
             subdomains = []
             try:
                 resp = with_retry(requests.get, f"https://crt.sh/?q=%25.{self.target}&output=json", timeout=10)
@@ -260,10 +237,9 @@ class AutonomousSecurityEngineer:
                     data = resp.json()
                     subdomains = list(set(entry['name_value'].strip() for entry in data if self.target in entry['name_value']))
             except Exception as e: logger.warning(f"crt.sh failed: {e}")
-            self.memory['subdomains'] = subdomains[:100] # Limit to top 100
+            self.memory['subdomains'] = subdomains[:100]
             self._log_reasoning("Subdomain Enumeration", f"Found {len(subdomains)} certificates.", "Expanded attack surface mapped.", "Medium")
 
-            # 3. Banner Grabbing (Tech Stack)
             try:
                 resp = requests.get(f"https://{self.target}", timeout=5, verify=False, allow_redirects=True)
                 banner = resp.headers.get('Server', 'Unknown')
@@ -286,7 +262,7 @@ class AutonomousSecurityEngineer:
         if 'error' in self.memory: return
         
         targets_to_triage = self.memory.get('ips', [])
-        if not re.match(r'^\d+\.\d+\.\d+\.\d+', self.target): # If not IP, add target itself
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+', self.target):
              targets_to_triage.append(self.target)
 
         intel_reports = {}
@@ -297,14 +273,132 @@ class AutonomousSecurityEngineer:
             report = {'vt': vt_res, 'abuse': abuse_res}
             intel_reports[item] = report
             
-            # Quick heuristic risk assessment
             risk = "Low"
             m_count = vt_res.get('data', {}).get('attributes', {}).get('last_analysis_stats', {}).get('malicious', 0)
             abuse_score = abuse_res.get('data', {}).get('abuseConfidenceScore', 0)
             
-            if m_count > 0 or abuse_score > 0:
-                risk = "Medium"
-            if m_count > 5 or abuse_score > 50:
-                risk = "High"
+            if m_count > 0 or abuse_score > 0: risk = "Medium"
+            if m_count > 5 or abuse_score > 50: risk = "High"
 
-            self._log_reasoning(f"Threat Triage: {item
+            self._log_reasoning(f"Threat Triage: {item}", f"VT Malicious: {m_count}, Abuse Score: {abuse_score}%", f"Indicator risk assessed as {risk}.", "High")
+        
+        self.memory['threat_intel'] = intel_reports
+
+    def perform_vulnerability_research(self):
+        """Agent 3 Implementation: Vuln Research"""
+        if 'error' in self.memory: return
+        
+        keywords = []
+        tech = self.memory.get('tech_stack', {})
+        if tech.get('X-Powered-By') != 'Unknown': keywords.append(tech.get('X-Powered-By'))
+        if tech.get('Server') != 'Unknown': keywords.append(tech.get('Server').split('/')[0])
+        keywords.append(self.target.split('.')[0])
+        
+        all_cves = []
+        for kw in list(set(keywords)):
+            cves = self.connectors.search_nvd(kw)
+            all_cves.extend(cves)
+            self._log_reasoning(f"NVD Search: {kw}", f"Found {len(cves)} CVEs", f"Correlated {kw} with known vulnerabilities.", "Medium" if cves else "High")
+        
+        unique_cves = {cve.cve_id: cve for cve in all_cves}
+        self.memory['vulnerabilities'] = list(unique_cves.values())
+
+    def perform_remediation_reasoning(self):
+        """Agent 4 Implementation: Remediation Strategist"""
+        if 'error' in self.memory: return
+        
+        context = f"Target: {self.target}\n"
+        context += f"Tech Stack: {json.dumps(self.memory.get('tech_stack', {}))}\n"
+        context += f"Threat Intel: {json.dumps(self.memory.get('threat_intel', {}))}\n"
+        context += f"Vulnerabilities (Top 5): {json.dumps([asdict(v) for v in self.memory.get('vulnerabilities', [])[:5]])}\n"
+        
+        system_prompt = """
+        You are an elite Autonomous AI Security Engineer. Your goal is to analyze the provided security telemetry (Recon, Threat Intel, CVEs)
+        and formulate a professional, risk-adjusted remediation strategy. Provide clear executive insights, reasoning traces, and recommended fixes.
+        """
+        
+        ai_response = self.connectors.call_groq(system_prompt, f"Analyze this telemetry and provide a comprehensive security report:\n{context}")
+        self.memory['ai_report'] = ai_response
+        self._log_reasoning("AI Remediation Strategy", "Telemetry synthesized by Groq AI model", "Generated automated tactical security guidance and executive report.", "High")
+
+# ==========================================
+# 4. STREAMLIT USER INTERFACE
+# ==========================================
+
+def main():
+    st.set_page_config(page_title="MHZALY AI Security Engineer", page_icon="🛡️", layout="wide")
+    
+    st.markdown("# 🛡️ MHZALY AI Security Engineer")
+    st.markdown("<p style='color: #9ca3af;'>Autonomous multi-agent platform for deep target recon, threat intelligence triage, NVD vulnerability correlation, and AI-driven remediation strategy.</p>", unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.subheader("🔑 API Configuration Status")
+        st.write(f"**VirusTotal API:** {'✅ Active' if st.secrets.get('VIRUSTOTAL_API_KEY') else '⚠️ Missing'}")
+        st.write(f"**AbuseIPDB API:** {'✅ Active' if st.secrets.get('ABUSEIPDB_API_KEY') else '⚠️ Missing'}")
+        st.write(f"**NVD API:** {'✅ Active' if st.secrets.get('NVD_API_KEY') else '⚠️ Optional/Standard'}")
+        st.write(f"**Groq AI Engine:** {'✅ Active' if st.secrets.get('GROQ_API_KEY') else '⚠️ Missing'}")
+        st.markdown("---")
+        st.info("Ensure all keys are placed in your Streamlit secrets (`st.secrets`).")
+
+    target_input = st.text_input("Target Domain or IP Address", placeholder="e.g., example.com or 8.8.8.8")
+    
+    if st.button("🚀 Launch Autonomous AI Security Engineer", use_container_width=True):
+        if not target_input:
+            st.warning("Please specify a valid target domain or IP address.")
+        else:
+            engine = AutonomousSecurityEngineer(target_input)
+            engine.run_pipeline()
+            
+            if 'error' in engine.memory:
+                st.error(f"Pipeline Halted: {engine.memory['error']}")
+            else:
+                st.success("Autonomous Security Assessment Complete!")
+                
+                tab1, tab2, tab3, tab4 = st.tabs(["🧠 AI Executive Report", "🔍 Reasoning Trace", "🛡️ Threat Intel & Assets", "🔬 Correlated CVEs"])
+                
+                with tab1:
+                    st.markdown("### Executive Strategy & Remediation")
+                    st.markdown(engine.memory.get('ai_report', 'No report generated.'))
+                    
+                    report_markdown = f"""# AI SECURITY ENGINEER ASSESSMENT REPORT
+**Target:** `{engine.target}`
+**Timestamp:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+
+## Executive Summary & AI Strategy
+{engine.memory.get('ai_report', 'N/A')}
+"""
+                    st.download_button("📥 Download Assessment Report (.md)", data=report_markdown, file_name=f"ai_security_report_{engine.target}.md", mime="text/markdown", use_container_width=True)
+
+                with tab2:
+                    st.markdown("### Agentic Reasoning Trace")
+                    for r in engine.reasoning_log:
+                        with st.expander(f"Task: {r.task} (Confidence: {r.confidence})"):
+                            st.write(f"**Evidence:** {r.evidence}")
+                            st.write(f"**Interpretation:** {r.interpretation}")
+
+                with tab3:
+                    st.markdown("### Reconnaissance & Threat Intel")
+                    st.write(f"**Resolved IPs:** {engine.memory.get('ips', [])}")
+                    st.write(f"**Tech Stack:** {engine.memory.get('tech_stack', {})}")
+                    
+                    subdomains = engine.memory.get('subdomains', [])
+                    if subdomains:
+                        st.markdown(f"**Enumerated Subdomains ({len(subdomains)}):**")
+                        st.dataframe(pd.DataFrame({'Subdomain': subdomains}), use_container_width=True)
+                        
+                    threats = engine.memory.get('threat_intel', {})
+                    if threats:
+                        st.markdown("**Threat Intelligence Triage:**")
+                        st.json(threats)
+
+                with tab4:
+                    st.markdown("### Correlated NVD Vulnerabilities")
+                    cves = engine.memory.get('vulnerabilities', [])
+                    if cves:
+                        cve_data = [asdict(c) for c in cves]
+                        st.dataframe(pd.DataFrame(cve_data), use_container_width=True)
+                    else:
+                        st.info("No matching high-confidence CVEs found for the fingerprinted stack.")
+
+if __name__ == "__main__":
+    main()

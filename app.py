@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MHZALY AI SECURITY ENGINEER - AUTONOMOUS AGENT SYSTEM v21.1
+MHZALY AI SECURITY ENGINEER - AUTONOMOUS AGENT SYSTEM v21.2 (No External DNS Dependency)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This is a complete, self-contained Autonomous AI Security Engineer platform.
-It integrates Deep Recon, Threat Intel Triage, NVD Correlation, and
-Autonomous Remediation Reasoning into a single, powerful agentic loop.
-
 Author: Muhammad Hassaan Zahid
 """
 
@@ -18,10 +14,9 @@ import logging
 import time
 import ipaddress
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Callable
 from dataclasses import dataclass, asdict
 import socket
-import dns.resolver
 import re
 
 # Configure logging
@@ -40,7 +35,7 @@ class ScopeViolation(Exception):
     pass
 
 def assert_public_host(hostname: str) -> None:
-    """SSRF guard. Resolves `hostname` and raises ScopeViolation if it lands on a private IP."""
+    """SSRF guard using standard socket library."""
     try:
         clean_host = hostname.replace('https://', '').replace('http://', '').split('/')[0]
         infos = socket.getaddrinfo(clean_host, None)
@@ -49,12 +44,12 @@ def assert_public_host(hostname: str) -> None:
             ip = ipaddress.ip_address(ip_str)
             if (ip.is_private or ip.is_loopback or ip.is_link_local or
                     ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-                raise ScopeViolation(f"Target '{hostname}' resolves to non-public IP ({ip_str}). Refusing to scan internal/reserved network space.")
+                raise ScopeViolation(f"Target '{hostname}' resolves to non-public IP ({ip_str}).")
     except socket.gaierror as e:
         raise ScopeViolation(f"Could not resolve host: {e}")
 
 def with_retry(fn: Callable, *args, retries: int = 3, backoff: float = 2.0, **kwargs):
-    """Simple retry with exponential backoff for flaky/rate-limited HTTP calls."""
+    """Simple retry with exponential backoff for HTTP calls."""
     last_exc = None
     for attempt in range(retries + 1):
         try:
@@ -62,13 +57,10 @@ def with_retry(fn: Callable, *args, retries: int = 3, backoff: float = 2.0, **kw
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_exc = e
             if attempt < retries:
-                sleep_time = backoff ** attempt
-                logger.warning(f"Retrying in {sleep_time:.1f} seconds due to: {e}")
-                time.sleep(sleep_time)
+                time.sleep(backoff ** attempt)
             else:
-                logger.error(f"Max retries reached. Last error: {e}")
+                logger.error(f"Max retries reached: {e}")
         except Exception as e:
-            logger.error(f"Non-retryable exception: {e}")
             raise e
     raise last_exc
 
@@ -99,7 +91,6 @@ class AgenticReasoning:
 # ==========================================
 
 class AIConnectors:
-    """Handles all external API communications securely."""
     def __init__(self):
         self.vt_key = st.secrets.get("VIRUSTOTAL_API_KEY", "")
         self.abuse_key = st.secrets.get("ABUSEIPDB_API_KEY", "")
@@ -107,7 +98,6 @@ class AIConnectors:
         self.groq_key = st.secrets.get("GROQ_API_KEY", "")
 
     def query_virustotal(self, indicator: str) -> Dict[str, Any]:
-        """Queries VirusTotal for domain/IP reputation."""
         if not self.vt_key: return {"error": "VirusTotal API Key missing."}
         is_ip = re.match(r'^\d+\.\d+\.\d+\.\d+$', indicator)
         url = f"https://www.virustotal.com/api/v3/ip_addresses/{indicator}" if is_ip else \
@@ -118,9 +108,8 @@ class AIConnectors:
         except Exception as e: return {"error": f"VT Connection Failed: {e}"}
 
     def query_abuseipdb(self, ip: str) -> Dict[str, Any]:
-        """Queries AbuseIPDB for IP reputation."""
         if not self.abuse_key: return {"error": "AbuseIPDB API Key missing."}
-        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip): return {"error": "Invalid IP format for AbuseIPDB."}
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip): return {"error": "Invalid IP format."}
         try:
             resp = with_retry(requests.get, "https://api.abuseipdb.com/api/v2/check",
                              headers={'Key': self.abuse_key, 'Accept': 'application/json'},
@@ -129,7 +118,6 @@ class AIConnectors:
         except Exception as e: return {"error": f"AbuseIPDB Connection Failed: {e}"}
 
     def search_nvd(self, keyword: str, max_results: int = 5) -> List[VulnerabilityRecord]:
-        """Searches NIST NVD for CVEs related to a keyword."""
         if not keyword: return []
         vulns = []
         try:
@@ -162,7 +150,6 @@ class AIConnectors:
         return sorted(vulns, key=lambda x: x.cvss_score, reverse=True)
 
     def call_groq(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096, temperature: float = 0.2) -> str:
-        """Calls Groq API for AI reasoning."""
         if not self.groq_key: return "ERROR: Groq API Key missing in secrets."
         try:
             payload = {
@@ -192,12 +179,10 @@ class AutonomousSecurityEngineer:
         self.reasoning_log: List[AgenticReasoning] = []
 
     def _log_reasoning(self, task: str, evidence: str, interpretation: str, confidence: str):
-        """Logs agent thought process."""
         logger.info(f"Agent Reasoning [{task}]: {interpretation} (Confidence: {confidence})")
         self.reasoning_log.append(AgenticReasoning("SecurityEngineer", task, evidence, interpretation, confidence))
 
     def run_pipeline(self):
-        """Executes the full autonomous Purple Team pipeline."""
         if not self.target: return
 
         with st.status(f"🚀 Launching Autonomous AI Security Engineer for: {self.target}...", expanded=True) as status:
@@ -222,11 +207,12 @@ class AutonomousSecurityEngineer:
                 status.update(label="✅ Autonomous Pipeline Completed", state="complete", expanded=False)
 
     def perform_recon(self):
-        """Agent 1 Implementation: Recon"""
         try:
             assert_public_host(self.target)
-            answers = dns.resolver.resolve(self.target, 'A')
-            ips = [str(r) for r in answers]
+            
+            # Use built-in socket for DNS resolution instead of dnspython
+            infos = socket.getaddrinfo(self.target, None)
+            ips = list(set(addr[4][0] for addr in infos if addr[0] == socket.AF_INET))
             self.memory['ips'] = ips
             self._log_reasoning("DNS Resolution", f"{self.target} resolved to {', '.join(ips)}", "Target is publicly resolvable.", "High")
 
@@ -258,7 +244,6 @@ class AutonomousSecurityEngineer:
             self._log_reasoning("Reconnaissance", str(e), "Reconnaissance phase failed.", "High")
 
     def perform_threat_triage(self):
-        """Agent 2 Implementation: Triage"""
         if 'error' in self.memory: return
         
         targets_to_triage = self.memory.get('ips', [])
@@ -285,7 +270,6 @@ class AutonomousSecurityEngineer:
         self.memory['threat_intel'] = intel_reports
 
     def perform_vulnerability_research(self):
-        """Agent 3 Implementation: Vuln Research"""
         if 'error' in self.memory: return
         
         keywords = []
@@ -304,7 +288,6 @@ class AutonomousSecurityEngineer:
         self.memory['vulnerabilities'] = list(unique_cves.values())
 
     def perform_remediation_reasoning(self):
-        """Agent 4 Implementation: Remediation Strategist"""
         if 'error' in self.memory: return
         
         context = f"Target: {self.target}\n"

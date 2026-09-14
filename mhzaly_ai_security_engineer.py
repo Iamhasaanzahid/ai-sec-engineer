@@ -258,11 +258,32 @@ class Connectors:
             return {"available": False, "error": str(e), "subdomains": []}
         return {"available": False, "error": "no certificate-transparency records found", "subdomains": []}
 
-    def search_nvd(self, keyword: str) -> Dict[str, Any]:
-        if not keyword:
-            return {"available": False, "reason": "no identifiable software/version keyword to correlate", "vulns": []}
+    @staticmethod
+    def _extract_cvss(cve: Dict[str, Any]) -> tuple:
+        """Return (score, severity) preferring v3.1 > v3.0 > v2, reading severity
+        from the correct spot in each schema (v2's baseSeverity lives on the metric
+        object itself, not inside cvssData)."""
+        metrics = cve.get('metrics', {})
+        for key in ('cvssMetricV31', 'cvssMetricV30'):
+            block = metrics.get(key)
+            if block:
+                data = block[0].get('cvssData', {})
+                return float(data.get('baseScore', 0.0)), data.get('baseSeverity', 'UNKNOWN')
+        block = metrics.get('cvssMetricV2')
+        if block:
+            data = block[0].get('cvssData', {})
+            sev = block[0].get('baseSeverity', 'UNKNOWN')  # v2 severity sits one level up
+            return float(data.get('baseScore', 0.0)), sev
+        return 0.0, 'UNKNOWN'
+
+    def search_nvd(self, product: str, version: str = "") -> Dict[str, Any]:
+        if not product:
+            return {"available": False,
+                     "reason": "no specific origin software/version was disclosed in response headers (only an edge proxy/CDN was visible), so CVE correlation was skipped rather than guessed",
+                     "vulns": []}
+        query = f"{product} {version}".strip()
         try:
-            params = {'keywordSearch': keyword, 'resultsPerPage': 5}
+            params = {'keywordSearch': query, 'resultsPerPage': 20}
             headers = {'apiKey': self.nvd_key} if self.nvd_key else {}
             resp = with_retry(requests.get, "https://services.nvd.nist.gov/rest/json/cves/2.0",
                               params=params, headers=headers, timeout=10, retries=1)
@@ -272,16 +293,16 @@ class Connectors:
                     cve = item.get('cve', {})
                     cve_id = cve.get('id')
                     desc = cve.get('descriptions', [{}])[0].get('value', 'No description')
-                    metrics = cve.get('metrics', {})
-                    cvss_block = (metrics.get('cvssMetricV31') or metrics.get('cvssMetricV30') or
-                                  metrics.get('cvssMetricV2') or [{}])
-                    cvss = cvss_block[0].get('cvssData', {}) if cvss_block else {}
-                    score = float(cvss.get('baseScore', 0.0))
-                    sev = cvss.get('baseSeverity', 'UNKNOWN')
+                    # relevance filter: the product name must actually appear in the CVE text,
+                    # otherwise NVD's free-text search just matched an unrelated word.
+                    if product.lower() not in desc.lower():
+                        continue
+                    score, sev = self._extract_cvss(cve)
                     vulns.append(VulnerabilityRecord(cve_id, cve_id, score, sev, desc,
-                                                      f"Review and, if applicable, patch the component matching '{keyword}'.",
+                                                      f"Confirm the exact running version of {query} before treating this as applicable, then patch/upgrade if it matches.",
                                                       "NVD (live)"))
-                return {"available": True, "vulns": vulns}
+                vulns.sort(key=lambda v: v.cvss_score, reverse=True)
+                return {"available": True, "vulns": vulns[:5], "query": query}
             if resp.status_code == 403:
                 return {"available": False, "reason": "NVD rate-limited this request (no API key configured)", "vulns": []}
             return {"available": False, "reason": f"NVD returned HTTP {resp.status_code}", "vulns": []}
@@ -415,13 +436,15 @@ class AnalystNarrator:
         if not cve.get('available'):
             return f"I didn't run a live CVE correlation ({cve.get('reason', 'no identifiable component')})."
         vulns = cve.get('vulns', [])
+        query = cve.get('query', '')
         if not vulns:
-            return "No CVEs matched the detected component in NVD."
+            return f"I searched NVD for '{query}' and, after filtering out anything that wasn't actually about that product, nothing relevant came back."
         top = max(vulns, key=lambda v: v.cvss_score)
-        return (f"Cross-referencing the detected server component against NVD returned {len(vulns)} "
-                f"potentially related advisories, the highest being {top.cve_id} (CVSS {top.cvss_score}, {top.severity}). "
-                f"These are keyword matches, not confirmed exploitable findings — they need manual validation "
-                f"against the actual running version before you act on them.")
+        sev_note = f"CVSS {top.cvss_score}, {top.severity}" if top.severity != 'UNKNOWN' else f"CVSS {top.cvss_score}" if top.cvss_score else "no CVSS score published"
+        return (f"I searched NVD for '{query}' and, after discarding anything where that product name wasn't actually "
+                f"mentioned in the CVE text, {len(vulns)} advisor{'y' if len(vulns)==1 else 'ies'} remained — the "
+                f"most severe being {top.cve_id} ({sev_note}). These are still text-match correlations, not confirmed "
+                f"exploitable findings — check the exact running version before acting on any of them.")
 
     def _threat_intel_paragraph(self) -> str:
         vt = self.m.get('threat_intel', {}).get('vt', {})
@@ -653,14 +676,37 @@ class AutonomousSecurityEngineer:
         self._log("Threat Intel", "Optional VT/AbuseIPDB keys present" if configured else "No VT/AbuseIPDB key configured",
                    "Used real reputation APIs." if configured else "Section marked as not-configured rather than showing a fake clean score.", "High" if configured else "Low")
 
+    @staticmethod
+    def _extract_product_version(header_value: str):
+        """Parse a real 'Product/Version' token out of a header value (e.g. 'nginx/1.18.0').
+        Returns (None, None) if no version is present — a bare vendor name like
+        'cloudflare' with no version is deliberately treated as not-specific-enough."""
+        if not header_value:
+            return None, None
+        m = re.search(r'([A-Za-z][A-Za-z0-9_\-]{1,30})/(\d[\d\.]{0,15})', header_value.strip())
+        if m:
+            return m.group(1), m.group(2)
+        return None, None
+
     def perform_vulnerability_research(self):
-        keyword = (self.memory.get('tech_stack', {}).get('Server') or '').split('/')[0].strip()
-        result = self.connectors.search_nvd(keyword)
+        tech = self.memory.get('tech_stack', {})
+        product, version = self._extract_product_version(tech.get('Server', ''))
+        if not product:
+            product, version = self._extract_product_version(tech.get('X-Powered-By', ''))
+        if not product:
+            bare = (tech.get('Server') or tech.get('X-Powered-By') or '').strip()
+            reason = (f"only a bare vendor/edge name ('{bare}') was disclosed with no version number — "
+                      f"a keyword search on that alone tends to match unrelated CVEs by coincidence, so it "
+                      f"was skipped instead of shown") if bare else "no origin software was disclosed in the response headers"
+            result = {"available": False, "reason": reason, "vulns": []}
+        else:
+            result = self.connectors.search_nvd(product, version)
         self.memory['vulnerability_result'] = result
         if result.get('available'):
-            self._log("NVD Research", f"{len(result['vulns'])} advisories returned for keyword '{keyword}'", "Live NVD keyword correlation, not a canned CVE.", "Medium")
+            self._log("NVD Research", f"{len(result['vulns'])} advisories matched '{result.get('query')}' after filtering for the product name actually appearing in the CVE text",
+                       "Live NVD correlation with a relevance filter, so a coincidental keyword hit can't pass as a real finding.", "Medium")
         else:
-            self._log("NVD Research", result.get('reason', 'unavailable'), "No fabricated CVE shown — correlation skipped honestly.", "Low")
+            self._log("NVD Research", result.get('reason', 'unavailable'), "No noisy/irrelevant CVE shown — correlation skipped honestly.", "Low")
 
     def perform_risk_scoring(self):
         score = 0
@@ -808,71 +854,159 @@ def main():
 
                 with tabs[2]:
                     st.markdown("### Recon & Assets")
-                    st.write(f"**Resolved IP Addresses:** {engine.memory.get('ips', [])}")
-                    st.write(f"**Detected Tech Stack:** {engine.memory.get('tech_stack', {})}")
+                    ips = engine.memory.get('ips', [])
+                    tech = engine.memory.get('tech_stack', {})
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        st.markdown("**Resolved IP Address(es)**")
+                        for ip in ips:
+                            st.code(ip, language=None)
+                        if not ips:
+                            st.markdown("<span class='not-configured'>No IP resolved.</span>", unsafe_allow_html=True)
+                    with rc2:
+                        st.markdown("**Disclosed Tech Stack**")
+                        st.markdown(f"- **Server:** `{tech.get('Server') or 'not disclosed'}`")
+                        st.markdown(f"- **X-Powered-By:** `{tech.get('X-Powered-By') or 'not disclosed'}`")
 
                 with tabs[3]:
                     st.markdown("### Certificate-Transparency Subdomains")
                     sd = engine.memory.get('subdomains', {})
                     if sd.get('available'):
-                        st.write(f"Total historical names found: {sd.get('total_found', 0)}")
-                        st.dataframe(pd.DataFrame(sd.get('subdomains', []), columns=["subdomain"]), use_container_width=True)
+                        st.metric("Historical names found", sd.get('total_found', 0))
+                        if sd.get('subdomains'):
+                            st.dataframe(pd.DataFrame(sd.get('subdomains', []), columns=["subdomain"]),
+                                         use_container_width=True, hide_index=True)
                     else:
-                        st.markdown(f"<span class='not-configured'>Unavailable: {sd.get('error','')}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='not-configured'>⚪ Unavailable — {sd.get('error','')}</span>", unsafe_allow_html=True)
 
                 with tabs[4]:
                     st.markdown("### WHOIS (RDAP)")
                     w = engine.memory.get('whois', {})
-                    st.json(w) if w.get('available') else st.markdown(f"<span class='not-configured'>Unavailable: {w.get('error','')}</span>", unsafe_allow_html=True)
+                    if w.get('available'):
+                        wc1, wc2, wc3 = st.columns(3)
+                        wc1.metric("Registrar", w.get('registrar', 'Unknown'))
+                        wc2.metric("Registered", (w.get('created') or 'unknown')[:10])
+                        wc3.metric("Expires", (w.get('expires') or 'unknown')[:10])
+                        if w.get('status'):
+                            st.caption("Status: " + ", ".join(w.get('status', [])))
+                    else:
+                        st.markdown(f"<span class='not-configured'>⚪ Unavailable — {w.get('error','')}</span>", unsafe_allow_html=True)
 
                 with tabs[5]:
                     st.markdown("### TLS/SSL")
                     t = engine.memory.get('tls', {})
-                    st.json(t) if t.get('available') else st.markdown(f"<span class='not-configured'>Unavailable: {t.get('error','')}</span>", unsafe_allow_html=True)
+                    if t.get('available'):
+                        tc1, tc2, tc3 = st.columns(3)
+                        tc1.metric("Protocol", t.get('protocol', 'unknown'))
+                        tc2.metric("Cipher Suite", t.get('cipher_suite', 'unknown'))
+                        tc3.metric("Cert Expires", t.get('expires', 'unknown'))
+                    else:
+                        st.markdown(f"<span class='not-configured'>🔴 Unavailable — {t.get('error','')}</span>", unsafe_allow_html=True)
 
                 with tabs[6]:
                     st.markdown("### HTTP Security Headers")
-                    st.write(f"**Present:** {hg.get('present', [])}")
-                    st.write(f"**Missing:** {hg.get('missing', [])}")
+                    hc1, hc2 = st.columns(2)
+                    with hc1:
+                        st.markdown("**✅ Present**")
+                        for h in hg.get('present', []):
+                            st.markdown(f"- 🟢 `{h}`")
+                        if not hg.get('present'):
+                            st.caption("None.")
+                    with hc2:
+                        st.markdown("**⚠️ Missing**")
+                        for h in hg.get('missing', []):
+                            st.markdown(f"- 🔴 `{h}`")
+                        if not hg.get('missing'):
+                            st.caption("None — full marks.")
 
                 with tabs[7]:
                     st.markdown("### Port Reconnaissance (live TCP connect scan)")
                     if ports:
-                        st.dataframe(pd.DataFrame(ports), use_container_width=True)
+                        df = pd.DataFrame(ports)
+                        df["status"] = df["open"].map(lambda o: "🟢 Open" if o else "⚪ Closed")
+                        df = df[["port", "service", "status"]].sort_values("port")
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                    else:
+                        st.markdown("<span class='not-configured'>No IP was available to scan.</span>", unsafe_allow_html=True)
 
                 with tabs[8]:
                     st.markdown("### WAF / CDN Fingerprint")
                     waf = engine.memory.get('waf', [])
-                    st.write(waf if waf else "No signature matched.")
+                    if waf:
+                        for w in waf:
+                            st.success(f"🛡️ {w}")
+                    else:
+                        st.markdown("<span class='not-configured'>⚪ No known WAF/CDN header signature matched — traffic may be hitting the origin directly.</span>", unsafe_allow_html=True)
 
                 with tabs[9]:
                     st.markdown("### Sensitive Path Exposure")
                     paths = engine.memory.get('sensitive_paths', [])
                     if paths:
-                        st.dataframe(pd.DataFrame(paths), use_container_width=True)
+                        df = pd.DataFrame(paths)
+                        df["status"] = df["exposed"].map(lambda e: "🔴 Exposed" if e else "🟢 Not exposed")
+                        df = df[["path", "status_code", "content_length", "status", "note"]]
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No results.")
 
                 with tabs[10]:
                     st.markdown("### IP Geolocation")
                     g = engine.memory.get('geolocation', {})
-                    st.json(g) if g.get('available') else st.markdown(f"<span class='not-configured'>Unavailable: {g.get('error','')}</span>", unsafe_allow_html=True)
+                    if g.get('available'):
+                        gc1, gc2, gc3 = st.columns(3)
+                        gc1.metric("Country", g.get('country', 'Unknown'))
+                        gc2.metric("City / Region", f"{g.get('city','?')}, {g.get('regionName','?')}")
+                        gc3.metric("ISP / Org", g.get('isp', 'Unknown'))
+                        st.caption(f"AS: {g.get('as', 'unknown')}")
+                    else:
+                        st.markdown(f"<span class='not-configured'>⚪ Unavailable — {g.get('error','')}</span>", unsafe_allow_html=True)
 
                 with tabs[11]:
-                    st.markdown("### Threat Intelligence (optional)")
-                    st.json(engine.memory.get('threat_intel', {}))
+                    st.markdown("### Threat Intelligence (optional enrichment)")
+                    ti = engine.memory.get('threat_intel', {})
+                    vt, abuse = ti.get('vt', {}), ti.get('abuse', {})
+                    tic1, tic2 = st.columns(2)
+                    with tic1:
+                        st.markdown("**VirusTotal**")
+                        if not vt.get('configured'):
+                            st.markdown("<span class='not-configured'>⚪ Not configured (optional).</span>", unsafe_allow_html=True)
+                        elif 'error' in vt:
+                            st.warning(vt['error'])
+                        else:
+                            stats = vt.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+                            mal = stats.get('malicious', 0)
+                            (st.error if mal else st.success)(f"{mal} vendor(s) flag this as malicious" if mal else "Clean reputation")
+                    with tic2:
+                        st.markdown("**AbuseIPDB**")
+                        if not abuse.get('configured'):
+                            st.markdown("<span class='not-configured'>⚪ Not configured (optional).</span>", unsafe_allow_html=True)
+                        elif 'error' in abuse:
+                            st.warning(abuse['error'])
+                        else:
+                            score = abuse.get('data', {}).get('abuseConfidenceScore', 0)
+                            (st.error if score > 25 else st.success)(f"Abuse confidence score: {score}/100")
 
                 with tabs[12]:
-                    st.markdown("### CVE Correlation (live NVD)")
+                    st.markdown("### CVE Correlation (live NVD, relevance-filtered)")
                     vr = engine.memory.get('vulnerability_result', {})
                     if vr.get('available') and vr.get('vulns'):
-                        st.dataframe(pd.DataFrame([asdict(v) for v in vr['vulns']]), use_container_width=True)
+                        st.caption(f"NVD query: `{vr.get('query','')}` — results below all literally mention that product name in the CVE text; still verify the exact running version before acting.")
+                        df = pd.DataFrame([asdict(v) for v in vr['vulns']])
+                        df = df[["cve_id", "cvss_score", "severity", "description", "remediation"]]
+                        st.dataframe(df, use_container_width=True, hide_index=True)
                     elif vr.get('available'):
-                        st.info("No matching CVEs found.")
+                        st.info(f"Searched NVD for '{vr.get('query','')}' — no relevant matches after filtering out coincidental keyword hits.")
                     else:
-                        st.markdown(f"<span class='not-configured'>Unavailable: {vr.get('reason','')}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='not-configured'>⚪ Skipped — {vr.get('reason','')}</span>", unsafe_allow_html=True)
 
                 with tabs[13]:
                     st.markdown("### Composite Risk Score")
-                    st.json(risk)
+                    rc1, rc2 = st.columns(2)
+                    rc1.metric("Score", f"{risk.get('score',0)}/100")
+                    rc2.metric("Level", risk.get('level', 'N/A'))
+                    st.markdown("**Contributing factors:**")
+                    for reason in risk.get('reasons', []):
+                        st.markdown(f"- {reason}")
 
 if __name__ == "__main__":
     main()

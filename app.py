@@ -827,7 +827,7 @@ def main():
                     "🧠 Analyst Report", "🔍 Reasoning Trace", "🌐 Recon & Assets", "🕸️ Subdomains",
                     "📇 WHOIS", "🔒 TLS", "🧾 Headers", "🔌 Ports",
                     "🧱 WAF/CDN", "📂 Sensitive Paths", "🌍 Geolocation",
-                    "🛡️ Threat Intel", "🔬 CVEs", "📊 Risk Score"
+                    "🛡️ Threat Intel", "🔬 CVEs", "📊 Risk Score", "⚡ Pro Engineer PoC & OWASP"
                 ])
 
                 with tabs[0]:
@@ -1007,6 +1007,34 @@ def main():
                     st.markdown("**Contributing factors:**")
                     for reason in risk.get('reasons', []):
                         st.markdown(f"- {reason}")
+
+                with tabs[14]:
+                    st.markdown("### ⚡ Professional Security Engineer Toolkit (OWASP & PoC)")
+                    st.markdown("This module maps findings to **OWASP Top 10 (2021)** and generates standard verification commands for manual pentesting confirmation.")
+                    
+                    st.markdown("#### 1. OWASP Top 10 Risk Mapping")
+                    owasp_items = []
+                    if hg.get('grade') in ['C', 'D', 'F']:
+                        owasp_items.append("**A05:2021 – Security Misconfiguration**: Missing critical HTTP security headers (HSTS, CSP, X-Frame-Options).")
+                    exposed_paths = [p for p in engine.memory.get('paths', []) if p['exposed']]
+                    if exposed_paths:
+                        owasp_items.append("**A01:2021 – Broken Access Control / Sensitive Data Exposure**: Exposed static paths or configuration backups found.")
+                    if not owasp_items:
+                        owasp_items.append("**No critical OWASP Top 10 mappings triggered** in the passive scope.")
+                    for item in owasp_items:
+                        st.markdown(f"- {item}")
+
+                    st.markdown("#### 2. Manual Verification & PoC Commands")
+                    st.code(f"""# Verify Security Headers & Server Banner
+curl -I -s https://{engine.target}
+
+# Check SSL/TLS Cipher Suite & Certificate Chain
+openssl s_client -connect {engine.target}:443 -servername {engine.target}
+
+# Test Sensitive Endpoint Exposure
+curl -s -I https://{engine.target}/.env
+curl -s -I https://{engine.target}/robots.txt
+""", language="bash")
 
 if __name__ == "__main__":
     main()
